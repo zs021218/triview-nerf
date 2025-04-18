@@ -12,6 +12,7 @@ class TriViewDataset(Dataset):
         self.split = split
         self.image_size = config.image_size
         self.focal = 0.5 * self.image_size
+        self.device = config.device
 
         # 加载三视图图像
         self.images = {}
@@ -35,13 +36,19 @@ class TriViewDataset(Dataset):
                 # 如果没有遮罩，则假设整个图像都是前景
                 self.masks[view] = torch.ones((self.image_size, self.image_size), dtype=torch.float32)
 
-        # 为每个视图生成光线
+        # 将图像保存在CPU内存中，减少GPU内存使用
         self.rays = self.generate_all_rays()
 
         # 根据分割决定使用的光线
         if split == 'train':
             # 训练中只使用前景区域的光线
             self.valid_indices = self.get_foreground_indices()
+
+            # 对于大型数据集，可以随机抽样来减少内存使用
+            if len(self.valid_indices) > 10000:
+                # 随机抽样 10000 个光线
+                rand_idx = torch.randperm(len(self.valid_indices))[:10000]
+                self.valid_indices = self.valid_indices[rand_idx]
         else:
             # 测试中使用所有光线
             self.valid_indices = torch.arange(len(self.rays['rays_o']))
@@ -79,10 +86,10 @@ class TriViewDataset(Dataset):
             all_view_ids.append(torch.ones(rays_o.reshape(-1, 3).shape[0], dtype=torch.long) * i)
 
         return {
-            'rays_o': torch.cat(all_rays_o, 0),
-            'rays_d': torch.cat(all_rays_d, 0),
-            'rgb': torch.cat(all_rgb, 0),
-            'view_ids': torch.cat(all_view_ids, 0)
+            'rays_o': torch.cat(all_rays_o, 0),  # 保存在CPU内存中
+            'rays_d': torch.cat(all_rays_d, 0),  # 保存在CPU内存中
+            'rgb': torch.cat(all_rgb, 0),  # 保存在CPU内存中
+            'view_ids': torch.cat(all_view_ids, 0)  # 保存在CPU内存中
         }
 
     def get_foreground_indices(self):

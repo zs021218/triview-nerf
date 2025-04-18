@@ -31,8 +31,10 @@ def generate_rays(H, W, focal, c2w):
 
 
 def get_view_matrix(view_type, distance=4.0):
-    """获取特定视图的相机到世界变换矩阵"""
-    # 设置三个基本视角
+    """获取特定视图的相机到世界变换矩阵 - 调整距离以确保对象在视图中"""
+    # 设置三个基本视角 - 缩短距离以确保对象在视野内
+    distance = distance * 0.5  # 将相机拉近，使对象更容易可见
+
     if view_type == "front":
         # 正面视图 (z轴方向)
         c2w = torch.tensor([

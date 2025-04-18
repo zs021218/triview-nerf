@@ -10,8 +10,8 @@ class NeRF(nn.Module):
         self.config = config
 
         # 计算编码后的输入维度
-        pos_enc_dims = 3 + 3 * 2 * config.pos_encoding_dims  # (x,y,z) + sin/cos编码
-        dir_enc_dims = 3 + 3 * 2 * config.dir_encoding_dims  # (dx,dy,dz) + sin/cos编码
+        pos_enc_dims = 3 + 3 * 2 * config.pos_encoding_dims
+        dir_enc_dims = 3 + 3 * 2 * config.dir_encoding_dims
 
         # 位置编码的MLP部分
         self.pts_linears = nn.ModuleList(
@@ -19,20 +19,19 @@ class NeRF(nn.Module):
             [nn.Linear(config.hidden_dims, config.hidden_dims) for _ in range(config.num_layers - 1)]
         )
 
-        # 密度预测
+        # 密度预测 - 使用正确的初始化
         self.density_linear = nn.Linear(config.hidden_dims, 1)
+        nn.init.xavier_uniform_(self.density_linear.weight)  # 更好的初始化
 
         # 视角相关的MLP部分
-        self.feature_linear = nn.Linear(config.hidden_dims, config.hidden_dims)
-        self.views_linear = nn.Linear(dir_enc_dims + config.hidden_dims, config.hidden_dims // 2)
+        self.feature_linear = nn.Linear(config.hidden_dims, config.hidden_dims // 2)
+        self.views_linear = nn.Linear(dir_enc_dims + config.hidden_dims // 2, config.hidden_dims // 2)
 
-        # RGB颜色预测
+        # RGB颜色预测 - 使用正确的初始化
         self.rgb_linear = nn.Linear(config.hidden_dims // 2, 3)
+        nn.init.xavier_uniform_(self.rgb_linear.weight)  # 更好的初始化
 
     def forward(self, x, d):
-        # x: [B, 3] 位置坐标
-        # d: [B, 3] 视角方向
-
         # 应用位置编码
         input_pts = pos_encoding(x, self.config.pos_encoding_dims)
         input_dirs = pos_encoding(d, self.config.dir_encoding_dims)
@@ -43,9 +42,8 @@ class NeRF(nn.Module):
             h = self.pts_linears[i](h)
             h = F.relu(h)
 
-        # 预测密度
-        density = self.density_linear(h)
-        density = F.relu(density)
+        # 预测密度 - 确保输出为正值，使用softplus而不是relu
+        density = F.softplus(self.density_linear(h))  # 使用softplus保证密度平滑正值
 
         # 处理特征和方向
         feat = self.feature_linear(h)
@@ -55,48 +53,42 @@ class NeRF(nn.Module):
         h = F.relu(h)
 
         # 预测RGB颜色
-        rgb = self.rgb_linear(h)
-        rgb = torch.sigmoid(rgb)  # 确保RGB值在[0,1]范围
+        rgb = torch.sigmoid(self.rgb_linear(h))  # 确保RGB值在[0,1]范围
 
         return torch.cat([rgb, density], -1)  # [B, 4] -> (R,G,B,density)
 
 
 class TriViewNeRF(nn.Module):
-    """三视图NeRF模型"""
+    """支持分层采样的三视图NeRF模型"""
 
     def __init__(self, config):
         super(TriViewNeRF, self).__init__()
         self.config = config
 
-        # 为每个视角创建一个单独的NeRF编码器
-        self.view_encoders = nn.ModuleDict({
-            view: NeRF(config) for view in config.views
-        })
+        # 使用一个共享网络处理所有视角和采样层次
+        self.nerf_network = NeRF(config)
 
         # 特征融合网络
         self.fusion_network = nn.Sequential(
-            nn.Linear(len(config.views) * 4, config.hidden_dims),
+            nn.Linear(4, config.hidden_dims // 2),
             nn.ReLU(),
-            nn.Linear(config.hidden_dims, config.hidden_dims),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dims, 4)  # 输出RGB和密度
+            nn.Linear(config.hidden_dims // 2, 4)
         )
 
+        # 初始化融合网络
+        for m in self.fusion_network.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+
     def forward(self, x, d):
-        # 从每个视角获取特征
-        view_features = []
-        for view in self.config.views:
-            features = self.view_encoders[view](x, d)
-            view_features.append(features)
+        # 使用相同的网络处理所有视角和采样层次
+        features = self.nerf_network(x, d)
 
-        # 拼接所有视角的特征
-        combined_features = torch.cat(view_features, dim=-1)
+        # 应用融合网络
+        output = self.fusion_network(features)
 
-        # 融合特征
-        output = self.fusion_network(combined_features)
-
-        # 分离RGB和密度
+        # 返回RGB和密度
         rgb = torch.sigmoid(output[..., :3])
-        density = F.relu(output[..., 3:4])
+        density = output[..., 3:4]  # 让渲染器处理激活函数
 
         return torch.cat([rgb, density], dim=-1)

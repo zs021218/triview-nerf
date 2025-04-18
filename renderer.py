@@ -1,27 +1,57 @@
 import torch
 import torch.nn.functional as F
+import numpy as np
+from utils import generate_rays
 
 
-class VolumeRenderer:
+class MicroalgaeVolumeRenderer:
+    """针对微藻优化的体积渲染器"""
+
     def __init__(self, config):
         self.config = config
 
     def sample_pdf(self, bins, weights, N_samples, det=False):
         """
-        根据权重对bins进行重要性采样
+        基于权重对bins进行重要性采样，加强对微藻边缘的采样
         """
+        device = weights.device
+
         # 获取PDF
         weights = weights + 1e-5  # 防止除零
         pdf = weights / torch.sum(weights, -1, keepdim=True)
         cdf = torch.cumsum(pdf, -1)
         cdf = torch.cat([torch.zeros_like(cdf[..., :1]), cdf], -1)  # (batch, len(bins))
 
+        # 微藻样本的边缘采样增强
+        if hasattr(self.config, 'is_microalgae') and self.config.is_microalgae:
+            # 扰动CDF使边缘更可能被选中
+            mid_point = cdf.shape[-1] // 2
+            edge_width = cdf.shape[-1] // 4
+
+            # 在边缘区域增强CDF
+            edge_mask = torch.zeros_like(cdf)
+            edge_mask[..., mid_point - edge_width:mid_point + edge_width] = 1.0
+            edge_factor = self.config.edge_sampling_boost * edge_mask
+
+            # 应用边缘增强，同时保持CDF的单调性
+            cdf_slope = cdf[..., 1:] - cdf[..., :-1]
+            enhanced_slope = cdf_slope * (1.0 + edge_factor[..., :-1])
+            enhanced_slope = F.softmax(enhanced_slope, dim=-1) * (cdf[..., -1:] - cdf[..., :1])
+
+            # 重建CDF
+            enhanced_cdf = torch.cat([torch.zeros_like(cdf[..., :1]),
+                                      torch.cumsum(enhanced_slope, -1)], -1)
+
+            # 平滑过渡
+            alpha = 0.7  # 混合因子
+            cdf = alpha * enhanced_cdf + (1.0 - alpha) * cdf
+
         # 采样
         if det:
-            u = torch.linspace(0., 1., steps=N_samples, device=cdf.device)
+            u = torch.linspace(0., 1., steps=N_samples, device=device)
             u = u.expand(list(cdf.shape[:-1]) + [N_samples])
         else:
-            u = torch.rand(list(cdf.shape[:-1]) + [N_samples], device=cdf.device)
+            u = torch.rand(list(cdf.shape[:-1]) + [N_samples], device=device)
 
         # 反演CDF
         u = u.contiguous()
@@ -41,8 +71,8 @@ class VolumeRenderer:
 
         return samples
 
-    def render_rays(self, model, rays_o, rays_d, use_fine_model=False):
-        """体渲染函数: 使用分层采样"""
+    def render_rays(self, model, rays_o, rays_d):
+        """体渲染函数: 针对微藻特性优化"""
         batch_size = rays_o.shape[0]
         device = rays_o.device
 
@@ -74,9 +104,6 @@ class VolumeRenderer:
             dirs_chunk = dirs_flat[i:end_i]
             raw_chunk = model(pts_chunk, dirs_chunk)
             raw.append(raw_chunk)
-            # 显式释放不需要的内存
-            if i > 0 and device.type == 'cuda':
-                torch.cuda.empty_cache()
 
         raw = torch.cat(raw, 0)
         coarse_raw = raw.reshape(batch_size, self.config.num_coarse_samples, 4)
@@ -84,7 +111,21 @@ class VolumeRenderer:
         # 解析网络输出
         rgb = coarse_raw[..., :3]  # [N_rays, N_samples, 3]
         sigma = coarse_raw[..., 3]  # [N_rays, N_samples]
-        sigma = F.softplus(sigma)  # 确保密度为正值
+
+        # 应用微藻特定的密度调整：增强边缘表示
+        if hasattr(self.config, 'is_microalgae') and self.config.is_microalgae:
+            # 计算距离光线原点的距离
+            dists_from_origin = torch.norm(pts - rays_o[..., None, :], dim=-1)
+
+            # 估计微藻边缘的位置 - 通常在中间区域
+            normalized_dists = (dists_from_origin - self.config.near) / (self.config.far - self.config.near)
+            edge_mask = torch.exp(-((normalized_dists - 0.5) ** 2) / 0.01)  # 高斯分布，在0.5处峰值
+
+            # 增强边缘区域的密度
+            sigma = sigma * (1.0 + edge_mask * 0.5)
+
+        # 确保密度非负
+        sigma = F.softplus(sigma)
 
         # 计算沿光线的距离
         dists = z_vals[..., 1:] - z_vals[..., :-1]
@@ -98,6 +139,18 @@ class VolumeRenderer:
         # 计算粗模型的RGB和深度
         coarse_rgb_map = torch.sum(weights[..., None] * rgb, -2)
         coarse_depth_map = torch.sum(weights * z_vals, -1)
+        coarse_acc_map = torch.sum(weights, -1)
+
+        outputs = {
+            'coarse': {
+                'rgb': coarse_rgb_map,  # 粗采样的RGB
+                'depth': coarse_depth_map,  # 粗采样的深度
+                'acc': coarse_acc_map,  # 粗采样的不透明度累积
+                'weights': weights,  # 权重
+                'z_vals': z_vals,  # 采样点
+                'sigma_avg': sigma.mean().item(),  # 平均密度
+            }
+        }
 
         # 如果使用分层采样，则进行第二次采样
         if self.config.use_hierarchical and self.config.num_fine_samples > 0:
@@ -125,9 +178,6 @@ class VolumeRenderer:
                 dirs_chunk = dirs_flat[i:end_i]
                 raw_chunk = model(pts_chunk, dirs_chunk)
                 raw.append(raw_chunk)
-                # 释放内存
-                if i > 0 and device.type == 'cuda':
-                    torch.cuda.empty_cache()
 
             raw = torch.cat(raw, 0)
             fine_raw = raw.reshape(batch_size, total_samples, 4)
@@ -135,6 +185,14 @@ class VolumeRenderer:
             # 解析网络输出
             rgb = fine_raw[..., :3]
             sigma = fine_raw[..., 3]
+
+            # 针对微藻的密度调整 - 类似粗采样调整
+            if hasattr(self.config, 'is_microalgae') and self.config.is_microalgae:
+                dists_from_origin = torch.norm(pts - rays_o[..., None, :], dim=-1)
+                normalized_dists = (dists_from_origin - self.config.near) / (self.config.far - self.config.near)
+                edge_mask = torch.exp(-((normalized_dists - 0.5) ** 2) / 0.01)
+                sigma = sigma * (1.0 + edge_mask * 0.5)
+
             sigma = F.softplus(sigma)
 
             # 重新计算距离和权重
@@ -150,44 +208,32 @@ class VolumeRenderer:
             depth_map = torch.sum(weights * z_vals_combined, -1)
             acc_map = torch.sum(weights, -1)
 
-            # 确保RGB在合理范围内
-            rgb_map = torch.clamp(rgb_map, 0, 1)
+            # 微藻颜色增强 - 增强饱和度
+            if hasattr(self.config, 'is_microalgae') and self.config.is_microalgae:
+                # 简单的颜色增强
+                sat_factor = 1.2  # 饱和度增强因子
 
-            return {
-                'coarse': {
-                    'rgb': coarse_rgb_map,  # 粗采样的RGB
-                    'depth': coarse_depth_map,  # 粗采样的深度
-                },
-                'fine': {
-                    'rgb': rgb_map,  # 细采样的RGB
-                    'depth': depth_map,  # 细采样的深度
-                    'acc': acc_map,  # 不透明度累积
-                    'weights': weights,  # 权重
-                    'z_vals': z_vals_combined,  # 采样点
-                    'sigma_avg': sigma.mean().item(),  # 平均密度
-                }
-            }
-        else:
-            # 如果不使用分层采样，只返回粗模型结果
-            # 确保RGB在合理范围内
-            coarse_rgb_map = torch.clamp(coarse_rgb_map, 0, 1)
-            acc_map = torch.sum(weights, -1)
+                # 计算灰度值
+                gray = 0.299 * rgb_map[..., 0] + 0.587 * rgb_map[..., 1] + 0.114 * rgb_map[..., 2]
+                gray = gray.unsqueeze(-1).repeat(1, 3)
 
-            return {
-                'coarse': {
-                    'rgb': coarse_rgb_map,  # 粗采样的RGB
-                    'depth': coarse_depth_map,  # 粗采样的深度
-                    'acc': acc_map,  # 不透明度累积
-                    'weights': weights,  # 权重
-                    'z_vals': z_vals,  # 采样点
-                    'sigma_avg': sigma.mean().item(),  # 平均密度
-                }
+                # 调整饱和度
+                rgb_map = rgb_map + sat_factor * (rgb_map - gray)
+                rgb_map = torch.clamp(rgb_map, 0.0, 1.0)
+
+            outputs['fine'] = {
+                'rgb': rgb_map,  # 细采样的RGB
+                'depth': depth_map,  # 细采样的深度
+                'acc': acc_map,  # 不透明度累积
+                'weights': weights,  # 权重
+                'z_vals': z_vals_combined,  # 采样点
+                'sigma_avg': sigma.mean().item(),  # 平均密度
             }
+
+        return outputs
 
     def render_image(self, model, H, W, focal, c2w):
         """渲染完整图像，使用分块处理"""
-        from utils import generate_rays
-
         rays_o, rays_d = generate_rays(H, W, focal, c2w)
         rays_o = rays_o.to(self.config.device)
         rays_d = rays_d.to(self.config.device)

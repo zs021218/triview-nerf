@@ -103,10 +103,42 @@ def create_video(config, view_name="novel", fps=30):
         # 读取所有帧
         frames = [imageio.imread(file) for file in frame_files]
 
-        # 创建视频
+        # 创建视频 - 确保使用正确的扩展名和视频写入器
         video_path = os.path.join(config.save_dir, f"{view_name}_progress.mp4")
-        imageio.mimsave(video_path, frames, fps=fps)
+
+        try:
+            # 尝试使用 imageio-ffmpeg (首选)
+            import imageio_ffmpeg
+            writer = imageio.get_writer(video_path, fps=fps, codec='libx264',
+                                        pixelformat='yuv420p', quality=8)
+            for frame in frames:
+                writer.append_data(frame)
+            writer.close()
+
+        except (ImportError, ValueError) as e:
+            print(f"Could not use ffmpeg: {e}")
+            print("Trying alternative method...")
+
+            # 备选方法: 使用 pillow
+            try:
+                import numpy as np
+                from PIL import Image
+
+                # 创建临时GIF (大多数系统都支持)
+                gif_path = os.path.join(config.save_dir, f"{view_name}_progress.gif")
+                with imageio.get_writer(gif_path, mode='I', duration=1000 / fps) as writer:
+                    for frame in frames:
+                        writer.append_data(frame)
+                print(f"Created GIF at {gif_path} (MP4 creation failed)")
+                return
+
+            except Exception as e2:
+                print(f"GIF creation also failed: {e2}")
+                print("Saving individual frames only.")
+                return
+
         print(f"Created video at {video_path}")
 
-    except ImportError:
-        print("imageio not found. Install it with 'pip install imageio imageio-ffmpeg' to create videos.")
+    except ImportError as e:
+        print(f"Required libraries not found: {e}")
+        print("Install with 'pip install imageio imageio-ffmpeg' to create videos.")

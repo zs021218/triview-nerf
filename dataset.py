@@ -13,6 +13,7 @@ class TriViewDataset(Dataset):
         self.image_size = config.image_size
         self.focal = 0.5 * self.image_size
         self.device = config.device
+        self.training = split == 'train'
 
         # 加载三视图图像
         self.images = {}
@@ -56,10 +57,20 @@ class TriViewDataset(Dataset):
         print(f"Dataset loaded: {len(self.valid_indices)} valid rays")
 
     def load_image(self, path):
-        """加载并预处理图像"""
+        """加载并预处理图像，针对微藻图像进行特别处理"""
         img = Image.open(path).convert('RGB')
         img = img.resize((self.image_size, self.image_size), Image.LANCZOS)
         img = np.array(img) / 255.0
+        
+        # 增强微藻图像的对比度
+        img = np.power(img, 0.9)  # 轻微提高对比度
+        
+        # 如果有白色背景，可以减弱它的影响
+        if hasattr(self.config, 'white_background') and self.config.white_background:
+            # 假设背景接近白色，轻微压暗以突出微藻
+            white_mask = (img.mean(axis=-1) > 0.9)
+            img[white_mask] = img[white_mask] * 0.95
+        
         return torch.tensor(img, dtype=torch.float32)
 
     def load_mask(self, path):
@@ -109,15 +120,35 @@ class TriViewDataset(Dataset):
 
         return torch.cat(fg_indices, 0)
 
+    def data_augmentation(self, ray_batch):
+        """对光线批次进行数据增强"""
+        # 只在训练阶段进行增强
+        if self.split != 'train' or not self.training:
+            return ray_batch
+        
+        # 随机颜色抖动
+        if np.random.random() < 0.5:
+            # 随机颜色扰动因子
+            color_factor = torch.ones(3) + torch.randn(3) * 0.05
+            ray_batch['rgb'] = ray_batch['rgb'] * color_factor.to(ray_batch['rgb'].device)
+            ray_batch['rgb'] = torch.clamp(ray_batch['rgb'], 0.0, 1.0)
+        
+        return ray_batch
+
     def __len__(self):
         return len(self.valid_indices)
 
     def __getitem__(self, idx):
         ray_idx = self.valid_indices[idx]
-
-        return {
+        
+        ray_batch = {
             'rays_o': self.rays['rays_o'][ray_idx],
             'rays_d': self.rays['rays_d'][ray_idx],
             'rgb': self.rays['rgb'][ray_idx],
             'view_id': self.rays['view_ids'][ray_idx]
         }
+        
+        # 应用数据增强
+        ray_batch = self.data_augmentation(ray_batch)
+        
+        return ray_batch

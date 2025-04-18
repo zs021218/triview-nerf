@@ -6,6 +6,11 @@ class VolumeRenderer:
     def __init__(self, config):
         self.config = config
 
+    def compute_transmittance(self, alpha):
+        """计算透射率 (1-alpha)，用于半透明物体的渲染"""
+        transmittance = torch.cumprod(1.0 - alpha + 1e-10, dim=-1)
+        return transmittance
+
     def sample_pdf(self, bins, weights, N_samples, det=False):
         """
         根据权重对bins进行重要性采样
@@ -42,7 +47,7 @@ class VolumeRenderer:
         return samples
 
     def render_rays(self, model, rays_o, rays_d, use_fine_model=False):
-        """体渲染函数: 使用分层采样"""
+        """体渲染函数: 使用分层采样，优化对微藻的渲染"""
         batch_size = rays_o.shape[0]
         device = rays_o.device
 
@@ -84,8 +89,12 @@ class VolumeRenderer:
         # 解析网络输出
         rgb = coarse_raw[..., :3]  # [N_rays, N_samples, 3]
         sigma = coarse_raw[..., 3]  # [N_rays, N_samples]
-        sigma = F.softplus(sigma)  # 确保密度为正值
-
+        
+        # 添加密度噪声以鼓励探索透明区域
+        if hasattr(self.config, 'density_noise_std') and self.config.density_noise_std > 0 and self.training:
+            noise = torch.randn_like(sigma) * self.config.density_noise_std
+            sigma = sigma + noise
+        
         # 计算沿光线的距离
         dists = z_vals[..., 1:] - z_vals[..., :-1]
         dists = torch.cat([dists, torch.ones_like(dists[..., :1]) * 1e-3], -1)
@@ -95,9 +104,35 @@ class VolumeRenderer:
         weights = alpha * torch.cumprod(
             torch.cat([torch.ones((batch_size, 1), device=device), 1.0 - alpha + 1e-10], -1), -1)[:, :-1]
 
+        # 计算透射率(微藻特有，用于半透明渲染)
+        transmittance = self.compute_transmittance(alpha)
+
         # 计算粗模型的RGB和深度
         coarse_rgb_map = torch.sum(weights[..., None] * rgb, -2)
         coarse_depth_map = torch.sum(weights * z_vals, -1)
+        
+        # 如果使用白色背景(适合微藻图像)
+        if hasattr(self.config, 'white_background') and self.config.white_background:
+            acc_map = torch.sum(weights, -1)
+            coarse_rgb_map = coarse_rgb_map + (1. - acc_map[..., None])
+
+        # 确保RGB在合理范围内
+        coarse_rgb_map = torch.clamp(coarse_rgb_map, 0, 1)
+        acc_map = torch.sum(weights, -1)
+
+        result = {
+            'coarse': {
+                'rgb': coarse_rgb_map,  # 粗采样的RGB
+                'depth': coarse_depth_map,  # 粗采样的深度
+                'acc': acc_map,  # 不透明度累积
+                'weights': weights,  # 权重
+                'z_vals': z_vals,  # 采样点
+                'sigma': sigma,  # 密度值，用于稀疏性损失
+                'transmittance': transmittance,  # 透明度，用于微藻渲染
+                'alpha': alpha,  # alpha值
+                'sigma_avg': sigma.mean().item(),  # 平均密度
+            }
+        }
 
         # 如果使用分层采样，则进行第二次采样
         if self.config.use_hierarchical and self.config.num_fine_samples > 0:
@@ -135,7 +170,11 @@ class VolumeRenderer:
             # 解析网络输出
             rgb = fine_raw[..., :3]
             sigma = fine_raw[..., 3]
-            sigma = F.softplus(sigma)
+            
+            # 添加密度噪声
+            if hasattr(self.config, 'density_noise_std') and self.config.density_noise_std > 0 and self.training:
+                noise = torch.randn_like(sigma) * self.config.density_noise_std
+                sigma = sigma + noise
 
             # 重新计算距离和权重
             dists = z_vals_combined[..., 1:] - z_vals_combined[..., :-1]
@@ -145,44 +184,34 @@ class VolumeRenderer:
             weights = alpha * torch.cumprod(
                 torch.cat([torch.ones((batch_size, 1), device=device), 1.0 - alpha + 1e-10], -1), -1)[:, :-1]
 
+            # 计算透射率
+            transmittance = self.compute_transmittance(alpha)
+
             # 计算细模型的最终RGB和深度
             rgb_map = torch.sum(weights[..., None] * rgb, -2)
             depth_map = torch.sum(weights * z_vals_combined, -1)
             acc_map = torch.sum(weights, -1)
 
+            # 如果使用白色背景
+            if hasattr(self.config, 'white_background') and self.config.white_background:
+                rgb_map = rgb_map + (1. - acc_map[..., None])
+
             # 确保RGB在合理范围内
             rgb_map = torch.clamp(rgb_map, 0, 1)
 
-            return {
-                'coarse': {
-                    'rgb': coarse_rgb_map,  # 粗采样的RGB
-                    'depth': coarse_depth_map,  # 粗采样的深度
-                },
-                'fine': {
-                    'rgb': rgb_map,  # 细采样的RGB
-                    'depth': depth_map,  # 细采样的深度
-                    'acc': acc_map,  # 不透明度累积
-                    'weights': weights,  # 权重
-                    'z_vals': z_vals_combined,  # 采样点
-                    'sigma_avg': sigma.mean().item(),  # 平均密度
-                }
+            result['fine'] = {
+                'rgb': rgb_map,  # 细采样的RGB
+                'depth': depth_map,  # 细采样的深度
+                'acc': acc_map,  # 不透明度累积
+                'weights': weights,  # 权重
+                'z_vals': z_vals_combined,  # 采样点
+                'sigma': sigma,  # 密度值
+                'transmittance': transmittance,  # 透明度
+                'alpha': alpha,  # alpha值
+                'sigma_avg': sigma.mean().item(),  # 平均密度
             }
-        else:
-            # 如果不使用分层采样，只返回粗模型结果
-            # 确保RGB在合理范围内
-            coarse_rgb_map = torch.clamp(coarse_rgb_map, 0, 1)
-            acc_map = torch.sum(weights, -1)
 
-            return {
-                'coarse': {
-                    'rgb': coarse_rgb_map,  # 粗采样的RGB
-                    'depth': coarse_depth_map,  # 粗采样的深度
-                    'acc': acc_map,  # 不透明度累积
-                    'weights': weights,  # 权重
-                    'z_vals': z_vals,  # 采样点
-                    'sigma_avg': sigma.mean().item(),  # 平均密度
-                }
-            }
+        return result
 
     def render_image(self, model, H, W, focal, c2w):
         """渲染完整图像，使用分块处理"""
@@ -201,6 +230,8 @@ class VolumeRenderer:
         all_depth_coarse = []
         all_rgb_fine = []
         all_depth_fine = []
+        all_weights_coarse = []
+        all_weights_fine = []
 
         for i in range(0, rays_o.shape[0], self.config.chunk_size):
             # 清除先前的缓存
@@ -217,10 +248,12 @@ class VolumeRenderer:
             # 收集结果
             all_rgb_coarse.append(results['coarse']['rgb'].cpu())
             all_depth_coarse.append(results['coarse']['depth'].cpu())
+            all_weights_coarse.append(results['coarse']['weights'].cpu())
 
             if 'fine' in results:
                 all_rgb_fine.append(results['fine']['rgb'].cpu())
                 all_depth_fine.append(results['fine']['depth'].cpu())
+                all_weights_fine.append(results['fine']['weights'].cpu())
 
             # 显式清理不再需要的张量
             del results
@@ -230,21 +263,25 @@ class VolumeRenderer:
         # 合并所有结果
         rgb_coarse = torch.cat(all_rgb_coarse, 0).reshape(H, W, 3)
         depth_coarse = torch.cat(all_depth_coarse, 0).reshape(H, W)
+        weights_coarse = torch.cat(all_weights_coarse, 0)
 
         result = {
             'coarse': {
                 'rgb': rgb_coarse,
-                'depth': depth_coarse
+                'depth': depth_coarse,
+                'weights': weights_coarse
             }
         }
 
         if len(all_rgb_fine) > 0:
             rgb_fine = torch.cat(all_rgb_fine, 0).reshape(H, W, 3)
             depth_fine = torch.cat(all_depth_fine, 0).reshape(H, W)
+            weights_fine = torch.cat(all_weights_fine, 0)
 
             result['fine'] = {
                 'rgb': rgb_fine,
-                'depth': depth_fine
+                'depth': depth_fine,
+                'weights': weights_fine
             }
 
         return result

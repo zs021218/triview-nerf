@@ -59,16 +59,16 @@ class NeRF(nn.Module):
 
 
 class TriViewNeRF(nn.Module):
-    """简化版三视图NeRF模型"""
+    """支持分层采样的三视图NeRF模型"""
 
     def __init__(self, config):
         super(TriViewNeRF, self).__init__()
         self.config = config
 
-        # 使用单个共享网络
+        # 使用一个共享网络处理所有视角和采样层次
         self.nerf_network = NeRF(config)
 
-        # 简化的融合网络，使用恰当的初始化
+        # 特征融合网络
         self.fusion_network = nn.Sequential(
             nn.Linear(4, config.hidden_dims // 2),
             nn.ReLU(),
@@ -81,14 +81,14 @@ class TriViewNeRF(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
 
     def forward(self, x, d):
-        # 使用相同的网络处理
+        # 使用相同的网络处理所有视角和采样层次
         features = self.nerf_network(x, d)
 
-        # 应用简单的特征融合
+        # 应用融合网络
         output = self.fusion_network(features)
 
-        # 分离RGB和密度，并确保值域正确
-        rgb = torch.sigmoid(output[..., :3])  # 确保RGB值在[0,1]
-        density = F.softplus(output[..., 3:4])  # 使用softplus确保密度为正值
+        # 返回RGB和密度
+        rgb = torch.sigmoid(output[..., :3])
+        density = output[..., 3:4]  # 让渲染器处理激活函数
 
         return torch.cat([rgb, density], dim=-1)

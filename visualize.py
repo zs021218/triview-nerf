@@ -23,7 +23,7 @@ def save_image(img_tensor, path):
 
 
 def visualize_results(model, renderer, config, epoch, novel_views=True):
-    """可视化结果和保存"""
+    """可视化粗细两个模型的结果"""
     model.eval()
     H, W = config.render_size, config.render_size
     focal = 0.5 * config.render_size
@@ -37,20 +37,30 @@ def visualize_results(model, renderer, config, epoch, novel_views=True):
         with torch.no_grad():
             results = renderer.render_image(model, H, W, focal, c2w)
 
-        rgb = results['rgb']
-        depth = results['depth']
+        # 保存粗采样结果
+        rgb_coarse = results['coarse']['rgb']
+        depth_coarse = results['coarse']['depth']
 
-        # 保存RGB和深度图
-        save_image(rgb, os.path.join(config.save_dir, f"epoch_{epoch}", f"{view}_rgb.png"))
+        save_image(rgb_coarse, os.path.join(config.save_dir, f"epoch_{epoch}", f"{view}_coarse_rgb.png"))
 
         # 归一化深度进行可视化
-        depth_vis = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+        depth_vis = (depth_coarse - depth_coarse.min()) / (depth_coarse.max() - depth_coarse.min() + 1e-8)
         save_image(depth_vis.unsqueeze(-1).repeat(1, 1, 3),
-                   os.path.join(config.save_dir, f"epoch_{epoch}", f"{view}_depth.png"))
+                   os.path.join(config.save_dir, f"epoch_{epoch}", f"{view}_coarse_depth.png"))
 
-    # 渲染新视角 (如果需要)
+        # 如果有细采样结果，也保存它们
+        if 'fine' in results:
+            rgb_fine = results['fine']['rgb']
+            depth_fine = results['fine']['depth']
+
+            save_image(rgb_fine, os.path.join(config.save_dir, f"epoch_{epoch}", f"{view}_fine_rgb.png"))
+
+            depth_vis = (depth_fine - depth_fine.min()) / (depth_fine.max() - depth_fine.min() + 1e-8)
+            save_image(depth_vis.unsqueeze(-1).repeat(1, 1, 3),
+                       os.path.join(config.save_dir, f"epoch_{epoch}", f"{view}_fine_depth.png"))
+
+    # 渲染新视角
     if novel_views:
-        # 生成一些新视角
         novel_views = [
             {"name": "novel_45", "rot_y": 45},
             {"name": "novel_90", "rot_y": 90},
@@ -65,23 +75,21 @@ def visualize_results(model, renderer, config, epoch, novel_views=True):
             c2w = torch.tensor([
                 [np.cos(angle), 0, -np.sin(angle), 0],
                 [0, 1, 0, 0],
-                [np.sin(angle), 0, np.cos(angle), -4],
+                [np.sin(angle), 0, np.cos(angle), -2],  # 更近的距离
                 [0, 0, 0, 1]
             ], dtype=torch.float32)
 
             with torch.no_grad():
                 results = renderer.render_image(model, H, W, focal, c2w)
 
-            rgb = results['rgb']
-            depth = results['depth']
+            # 保存粗采样结果
+            rgb_coarse = results['coarse']['rgb']
+            save_image(rgb_coarse, os.path.join(config.save_dir, f"epoch_{epoch}", f"{view['name']}_coarse_rgb.png"))
 
-            # 保存RGB和深度图
-            save_image(rgb, os.path.join(config.save_dir, f"epoch_{epoch}", f"{view['name']}_rgb.png"))
-
-            # 归一化深度进行可视化
-            depth_vis = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-            save_image(depth_vis.unsqueeze(-1).repeat(1, 1, 3),
-                       os.path.join(config.save_dir, f"epoch_{epoch}", f"{view['name']}_depth.png"))
+            # 如果有细采样结果，也保存它们
+            if 'fine' in results:
+                rgb_fine = results['fine']['rgb']
+                save_image(rgb_fine, os.path.join(config.save_dir, f"epoch_{epoch}", f"{view['name']}_fine_rgb.png"))
 
     model.train()
 
@@ -92,12 +100,22 @@ def create_video(config, view_name="novel", fps=30):
         import imageio
         import glob
 
-        # 找到所有相关帧
-        frames_pattern = os.path.join(config.save_dir, "epoch_*", f"{view_name}*_rgb.png")
-        frame_files = sorted(glob.glob(frames_pattern))
+        # 找到所有相关帧 - 优先使用细采样结果
+        frames_pattern_fine = os.path.join(config.save_dir, "epoch_*", f"{view_name}*_fine_rgb.png")
+        frames_pattern_coarse = os.path.join(config.save_dir, "epoch_*", f"{view_name}*_coarse_rgb.png")
+
+        # 首先检查是否有细采样结果
+        frame_files_fine = sorted(glob.glob(frames_pattern_fine))
+        if len(frame_files_fine) > 0:
+            frame_files = frame_files_fine
+            print(f"Using fine sampling results for video ({len(frame_files)} frames)")
+        else:
+            # 如果没有细采样结果，使用粗采样结果
+            frame_files = sorted(glob.glob(frames_pattern_coarse))
+            print(f"Using coarse sampling results for video ({len(frame_files)} frames)")
 
         if len(frame_files) == 0:
-            print(f"No frames found matching pattern: {frames_pattern}")
+            print(f"No frames found matching patterns: {frames_pattern_fine} or {frames_pattern_coarse}")
             return
 
         # 读取所有帧

@@ -12,8 +12,13 @@ class Config:
     hidden_dims = 256  # 减少隐藏层维度(从256降到128)
     num_layers = 8  # 减少MLP层数(从8降到6)
 
+    # 添加分层采样配置
+    num_coarse_samples = 64  # 粗采样点数
+    num_fine_samples = 64 # 细采样点数
+    use_hierarchical = True  # 是否使用分层采样
+    perturb = True  # 是否添加随机扰动到采样点
+
     # 体渲染配置
-    num_samples = 64  # 减少每条光线上的采样点数(从64降到48)
     near = 0.01  # 近平面距离
     far = 3.0  # 远平面距离
 
